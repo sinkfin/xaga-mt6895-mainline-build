@@ -360,6 +360,121 @@ jobs:
           gzip -n -9 -c arch/arm64/boot/Image > "../out/Image-${TS}.gz"
           ls -l "../out/Image-${TS}.gz"
 
+      - name: 断言 Image 内嵌了 xaga 板级 DTB
+        if: ${{ env.BUILD_KERNEL == 'true' || env.REUSE_RUN_ID == '' }}
+        run: |
+          set -euo pipefail
+          # xaga 的 DTB 是 objcopy 链进 vmlinux 的 (不是 appended), 所以 mkbootimg 不能传 --dtb。
+          # 万一哪天上游改了嵌入方式 / defconfig 把 DTB 弄丢了, 编出来的镜像能打包能过头部校验,
+          # 但刷上就是黑屏 —— 这里直接拦住。
+          python3 - linux/arch/arm64/boot/Image <<'PY'
+          import sys
+
+          path = sys.argv[1]
+          MAGIC = b"\xd0\x0d\xfe\xed"
+          CHUNK = 8 << 20
+          WINDOW = 65536
+          hits, with_xaga = [], []
+          with open(path, "rb") as f:
+              prev = b""
+              base = 0
+              while True:
+                  buf = f.read(CHUNK)
+                  if not buf:
+                      break
+                  data = prev + buf
+                  start = 0
+                  while True:
+                      i = data.find(MAGIC, start)
+                      if i < 0:
+                          break
+                      hits.append(base + i)
+                      if b"xaga" in data[i:i + WINDOW]:
+                          with_xaga.append(base + i)
+                      start = i + 1
+                  base = base + len(data) - 8
+                  prev = data[-8:]
+          print("Image 里 DTB magic(d00dfeed) 命中 %d 处: %s" % (len(hits), hits[:5]))
+          print("其中附近带 'xaga' 字符串的: %s" % (with_xaga[:5] or "无"))
+          if not hits:
+              print("::error::Image 里一个 DTB magic 都没有 —— 板级 DTB 没编进去, 别打包")
+              sys.exit(1)
+          if not with_xaga:
+              print("::warning::找到 DTB 但附近没有 'xaga' 字符串, 人工确认一下是不是对的板级 DTB")
+          PY
+
+      - name: 打印内嵌 DTB 的 reserved-memory (排障用)
+        if: ${{ env.BUILD_KERNEL == 'true' || env.REUSE_RUN_ID == '' }}
+        run: |
+          set -euo pipefail
+          # MT6895 的 ATF/TEE/SCP/SSPM/MCUPM 内存是 bootloader 占着的, 必须靠 reserved-memory
+          # 从内核手里划出去。上游有一次把这些地址整体改写过, 结果内核把活着的固件内存当普通
+          # 内存分配, DMA 一踩页表就随机崩 (过 logo 后黑屏重启)。这里把表打进日志, 出问题时
+          # 跟上一份能启动的对比一眼就能看出来。
+          python3 - linux/arch/arm64/boot/Image <<'PY'
+          import struct
+          import sys
+
+          path = sys.argv[1]
+          with open(path, "rb") as f:
+              raw = f.read()
+
+          base = raw.find(b"\xd0\x0d\xfe\xed")
+          if base < 0:
+              print("::error::Image 里找不到 DTB magic, 板级 DTB 没编进去")
+              sys.exit(1)
+
+          magic, totalsize, off_struct, off_strings = struct.unpack_from(">IIII", raw, base)
+          dtb = raw[base:base + totalsize]
+          strs = dtb[off_strings:]
+          p = off_struct
+          cur = []
+          nodes = []
+          props = {}
+          while p < len(dtb):
+              tok = struct.unpack_from(">I", dtb, p)[0]
+              p += 4
+              if tok == 1:
+                  e = dtb.index(b"\0", p)
+                  name = dtb[p:e].decode("utf-8", "replace")
+                  p = (e + 4) & ~3
+                  cur.append(name)
+                  nodes.append("/" + "/".join(cur))
+              elif tok == 2:
+                  if cur:
+                      cur.pop()
+              elif tok == 3:
+                  plen, nameoff = struct.unpack_from(">II", dtb, p)
+                  p += 8
+                  nm = strs[nameoff:strs.index(b"\0", nameoff)].decode("utf-8", "replace")
+                  props[("/" + "/".join(cur)) + "/" + nm] = dtb[p:p + plen]
+                  p += plen
+                  p = (p + 3) & ~3
+              elif tok == 9:
+                  break
+              else:
+                  break
+
+          for k in ("/model", "/compatible"):
+              if k in props:
+                  print("%s = %s" % (k, props[k].rstrip(b"\0").decode("utf-8", "replace")))
+
+          rm = sorted(n for n in nodes if n.startswith("//reserved-memory/") and n.count("/") == 3)
+          print("reserved-memory 区域 %d 个:" % len(rm))
+          for n in rm:
+              reg = props.get(n + "/reg", b"")
+              if len(reg) >= 16:
+                  a, s = struct.unpack(">QQ", reg[:16])
+                  print("  %-58s 0x%016x + 0x%x" % (n.split("/")[-1], a, s))
+              else:
+                  print("  %-58s (无 reg)" % n.split("/")[-1])
+
+          if not rm:
+              print("::error::内嵌 DTB 里没有 reserved-memory 区域 —— ATF/TEE/SCP/SSPM 的内存"
+                    " 会被内核当普通内存分配, DMA 踩页表后开机随机崩")
+              sys.exit(1)
+          PY
+
       - name: 编译内核模块
         if: ${{ (env.BUILD_KERNEL == 'true' || env.REUSE_RUN_ID == '') && (env.BUILD_MODULES == 'true' || env.REUSE_RUN_ID == '') }}
         run: |
@@ -664,7 +779,7 @@ jobs:
             echo ""
             echo "刷写:"
             echo "  fastboot flash boot boot-<时间戳>.img"
-            echo "  fastboot flash rootfs rootfs-sparse-<时间戳>.img"
+            echo "  fastboot flash userdata rootfs-sparse-<时间戳>.img"
             echo "  fastboot reboot"
             echo "  首次开机后: resize2fs /dev/sdc86"
           } > BUILD-INFO.txt
@@ -725,7 +840,7 @@ jobs:
           \`\`\`bash
           # MTK v4 boot header 不支持 fastboot boot, 必须刷到对应槽位
           fastboot flash boot boot-<时间戳>.img
-          fastboot flash rootfs rootfs-sparse-<时间戳>.img
+          fastboot flash userdata rootfs-sparse-<时间戳>.img
           fastboot reboot
           \`\`\`
 
